@@ -416,14 +416,13 @@ static int bme680_init(const struct device *dev)
 		return err;
 	}
 
-	err = bme680_reg_write(dev, BME680_REG_RES_HEAT0,
-			       bme680_calc_res_heat(data, BME680_HEATR_TEMP));
+	// Disable the VOC heater by setting the temp and wait to 0
+	err = bme680_reg_write(dev, BME680_REG_RES_HEAT0, 0);
 	if (err < 0) {
 		return err;
 	}
 
-	err = bme680_reg_write(dev, BME680_REG_GAS_WAIT0,
-			       bme680_calc_gas_wait(BME680_HEATR_DUR_MS));
+	err = bme680_reg_write(dev, BME680_REG_GAS_WAIT0, 0);
 	if (err < 0) {
 		return err;
 	}
