@@ -1,6 +1,6 @@
 .. zephyr:code-sample:: uac2-explicit-feedback
    :name: USB Audio asynchronous explicit feedback sample
-   :relevant-api: _usb_device_core_api i2s_interface
+   :relevant-api: usbd_api uac2_device i2s_interface
 
    USB Audio 2 explicit feedback sample playing audio on I2S.
 
@@ -59,6 +59,6 @@ To build and flash the application:
 
 .. zephyr-app-commands::
    :zephyr-app: samples/subsys/usb/uac2_explicit_feedback
-   :board: nrf5340dk_nrf5340_cpuapp
+   :board: nrf5340dk/nrf5340/cpuapp
    :goals: build flash
    :compact:

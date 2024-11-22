@@ -19,7 +19,7 @@
 static const uint8_t magic[] = {0x45, 0x6d, 0x31, 0x6c, 0x31, 0x4b,
 				0x30, 0x72, 0x6e, 0x33, 0x6c, 0x69, 0x34};
 
-#if IS_ENABLED(CONFIG_IPC_SERVICE_BACKEND_ICMSG_WQ_ENABLE)
+#if defined(CONFIG_IPC_SERVICE_BACKEND_ICMSG_WQ_ENABLE)
 static K_THREAD_STACK_DEFINE(icmsg_stack, CONFIG_IPC_SERVICE_BACKEND_ICMSG_WQ_STACK_SIZE);
 static struct k_work_q icmsg_workq;
 static struct k_work_q *const workq = &icmsg_workq;
@@ -32,12 +32,12 @@ static int mbox_deinit(const struct icmsg_config_t *conf,
 {
 	int err;
 
-	err = mbox_set_enabled(&conf->mbox_rx, 0);
+	err = mbox_set_enabled_dt(&conf->mbox_rx, 0);
 	if (err != 0) {
 		return err;
 	}
 
-	err = mbox_register_callback(&conf->mbox_rx, NULL, NULL);
+	err = mbox_register_callback_dt(&conf->mbox_rx, NULL, NULL);
 	if (err != 0) {
 		return err;
 	}
@@ -54,7 +54,7 @@ static void notify_process(struct k_work *item)
 	struct icmsg_data_t *dev_data =
 		CONTAINER_OF(dwork, struct icmsg_data_t, notify_work);
 
-	(void)mbox_send(&dev_data->cfg->mbox_tx, NULL);
+	(void)mbox_send_dt(&dev_data->cfg->mbox_tx, NULL);
 
 	atomic_t state = atomic_get(&dev_data->state);
 
@@ -181,12 +181,12 @@ static int mbox_init(const struct icmsg_config_t *conf,
 	k_work_init(&dev_data->mbox_work, mbox_callback_process);
 	k_work_init_delayable(&dev_data->notify_work, notify_process);
 
-	err = mbox_register_callback(&conf->mbox_rx, mbox_callback, dev_data);
+	err = mbox_register_callback_dt(&conf->mbox_rx, mbox_callback, dev_data);
 	if (err != 0) {
 		return err;
 	}
 
-	return mbox_set_enabled(&conf->mbox_rx, 1);
+	return mbox_set_enabled_dt(&conf->mbox_rx, 1);
 }
 
 int icmsg_open(const struct icmsg_config_t *conf,
@@ -293,7 +293,7 @@ int icmsg_send(const struct icmsg_config_t *conf,
 
 	__ASSERT_NO_MSG(conf->mbox_tx.dev != NULL);
 
-	ret = mbox_send(&conf->mbox_tx, NULL);
+	ret = mbox_send_dt(&conf->mbox_tx, NULL);
 	if (ret) {
 		return ret;
 	}
@@ -301,7 +301,7 @@ int icmsg_send(const struct icmsg_config_t *conf,
 	return sent_bytes;
 }
 
-#if IS_ENABLED(CONFIG_IPC_SERVICE_BACKEND_ICMSG_WQ_ENABLE)
+#if defined(CONFIG_IPC_SERVICE_BACKEND_ICMSG_WQ_ENABLE)
 
 static int work_q_init(void)
 {

@@ -10,6 +10,8 @@
 /**
  * @brief EC Host Command Interface
  * @defgroup ec_host_cmd_interface EC Host Command Interface
+ * @since 2.4
+ * @version 0.1.0
  * @ingroup io_interfaces
  * @{
  */
@@ -78,6 +80,13 @@ enum ec_host_cmd_log_level {
 	EC_HOST_CMD_DEBUG_MODES /* Number of host command debug modes */
 };
 
+enum ec_host_cmd_state {
+	EC_HOST_CMD_STATE_DISABLED = 0,
+	EC_HOST_CMD_STATE_RECEIVING,
+	EC_HOST_CMD_STATE_PROCESSING,
+	EC_HOST_CMD_STATE_SENDING,
+};
+
 typedef void (*ec_host_cmd_user_cb_t)(const struct ec_host_cmd_rx_ctx *rx_ctx, void *user_data);
 typedef enum ec_host_cmd_status (*ec_host_cmd_in_progress_cb_t)(void *user_data);
 
@@ -98,6 +107,7 @@ struct ec_host_cmd {
 	 */
 	ec_host_cmd_user_cb_t user_cb;
 	void *user_data;
+	enum ec_host_cmd_state state;
 #ifdef CONFIG_EC_HOST_CMD_DEDICATED_THREAD
 	struct k_thread thread;
 #endif /* CONFIG_EC_HOST_CMD_DEDICATED_THREAD */
@@ -339,7 +349,7 @@ bool ec_host_cmd_send_in_progress_ended(void);
  * @brief Get final result of a last Host Command that has sent EC_HOST_CMD_IN_PROGRESS status.
  *
  * A Host Command that sends EC_HOST_CMD_IN_PROGRESS status doesn't send a final result.
- * Get the saved status with this function. The status can be get only once. Futher calls return
+ * Get the saved status with this function. The status can be get only once. Further calls return
  * EC_HOST_CMD_UNAVAILABLE.
  *
  * Saving status of Host Commands that send response data is not supported.

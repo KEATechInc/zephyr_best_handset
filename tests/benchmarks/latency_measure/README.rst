@@ -23,20 +23,41 @@ including:
 * Time it takes to send and receive events
 * Time it takes to wait for events (and context switch)
 * Time it takes to wake and switch to a thread waiting for events
+* Time it takes to push and pop to/from a k_stack
 * Measure average time to alloc memory from heap then free that memory
 
-When userspace is enabled using the prj_user.conf configuration file, this benchmark will
-where possible, also test the above capabilities using various configurations involving user
-threads:
+When userspace is enabled, this benchmark will where possible, also test the
+above capabilities using various configurations involving user threads:
 
 * Kernel thread to kernel thread
 * Kernel thread to user thread
 * User thread to kernel thread
 * User thread to user thread
 
+The default configuration builds only for the kernel. However, additional
+configurations can be enabled via the use of EXTRA_CONF_FILE.
+
+For example, the following will build this project with userspace support:
+
+    EXTRA_CONF_FILE="prj.userspace.conf" west build -p -b <board> <path to project>
+
+The following table summarizes the purposes of the different extra
+configuration files that are available to be used with this benchmark.
+A tester may mix and match them allowing them different scenarios to
+be easily compared the default.
+
++-----------------------------+------------------------------------+
+| prj.canaries.conf           | Enable stack canaries              |
++-----------------------------+------------------------------------+
+| prj.objcore.conf            | Enable object cores and statistics |
++-----------------------------+------------------------------------+
+| prj.timeslicing.conf        | Enable timeslicing                 |
++-----------------------------+------------------------------------+
+| prj.userspace.conf          | Enable userspace support           |
++-----------------------------+------------------------------------+
+
 Sample output of the benchmark (without userspace enabled)::
 
-        *** Booting Zephyr OS build zephyr-v3.5.0-4267-g6ccdc31233a3 ***
         thread.yield.preemptive.ctx.k_to_k       - Context switch via k_yield                         :     329 cycles ,     2741 ns :
         thread.yield.cooperative.ctx.k_to_k      - Context switch via k_yield                         :     329 cycles ,     2741 ns :
         isr.resume.interrupted.thread.kernel     - Return from ISR to interrupted thread              :     363 cycles ,     3033 ns :
@@ -74,6 +95,12 @@ Sample output of the benchmark (without userspace enabled)::
         semaphore.take.immediate.kernel          - Take a semaphore (no blocking)                     :      69 cycles ,      575 ns :
         semaphore.take.blocking.k_to_k           - Take a semaphore (context switch)                  :     494 cycles ,     4116 ns :
         semaphore.give.wake+ctx.k_to_k           - Give a semaphore (context switch)                  :     599 cycles ,     4992 ns :
+        condvar.wait.blocking.k_to_k             - Wait for a condvar (context switch)                :     692 cycles ,     5767 ns :
+        condvar.signal.wake+ctx.k_to_k           - Signal a condvar (context switch)                  :     715 cycles ,     5958 ns :
+        stack.push.immediate.kernel              - Add data to k_stack (no ctx switch)                :     166 cycles ,     1391 ns :
+        stack.pop.immediate.kernel               - Get data from k_stack (no ctx switch)              :      82 cycles ,      691 ns :
+        stack.pop.blocking.k_to_k                - Get data from k_stack (w/ ctx switch)              :     499 cycles ,     4166 ns :
+        stack.push.wake+ctx.k_to_k               - Add data to k_stack (w/ ctx switch)                :     645 cycles ,     5375 ns :
         mutex.lock.immediate.recursive.kernel    - Lock a mutex                                       :     100 cycles ,      833 ns :
         mutex.unlock.immediate.recursive.kernel  - Unlock a mutex                                     :      40 cycles ,      333 ns :
         heap.malloc.immediate                    - Average time for heap malloc                       :     627 cycles ,     5225 ns :
@@ -84,7 +111,6 @@ Sample output of the benchmark (without userspace enabled)::
 
 Sample output of the benchmark (with userspace enabled)::
 
-        *** Booting Zephyr OS build zephyr-v3.5.0-4268-g6af7a1230a08 ***
         thread.yield.preemptive.ctx.k_to_k       - Context switch via k_yield                         :     970 cycles ,     8083 ns :
         thread.yield.preemptive.ctx.u_to_u       - Context switch via k_yield                         :    1260 cycles ,    10506 ns :
         thread.yield.preemptive.ctx.k_to_u       - Context switch via k_yield                         :    1155 cycles ,     9632 ns :
@@ -183,6 +209,26 @@ Sample output of the benchmark (with userspace enabled)::
         semaphore.give.wake+ctx.k_to_u           - Give a semaphore (context switch)                  :    1434 cycles ,    11957 ns :
         semaphore.take.blocking.u_to_u           - Take a semaphore (context switch)                  :    1690 cycles ,    14090 ns :
         semaphore.give.wake+ctx.u_to_u           - Give a semaphore (context switch)                  :    1800 cycles ,    15000 ns :
+        condvar.wait.blocking.k_to_k             - Wait for a condvar (context switch)                :    1385 cycles ,    11542 ns :
+        condvar.signal.wake+ctx.k_to_k           - Signal a condvar (context switch)                  :    1420 cycles ,    11833 ns :
+        condvar.wait.blocking.k_to_u             - Wait for a condvar (context switch)                :    1537 cycles ,    12815 ns :
+        condvar.signal.wake+ctx.u_to_k           - Signal a condvar (context switch)                  :    1950 cycles ,    16250 ns :
+        condvar.wait.blocking.u_to_k             - Wait for a condvar (context switch)                :    2025 cycles ,    16875 ns :
+        condvar.signal.wake+ctx.k_to_u           - Signal a condvar (context switch)                  :    1715 cycles ,    14298 ns :
+        condvar.wait.blocking.u_to_u             - Wait for a condvar (context switch)                :    2313 cycles ,    19279 ns :
+        condvar.signal.wake+ctx.u_to_u           - Signal a condvar (context switch)                  :    2225 cycles ,    18541 ns :
+        stack.push.immediate.kernel              - Add data to k_stack (no ctx switch)                :     244 cycles ,     2041 ns :
+        stack.pop.immediate.kernel               - Get data from k_stack (no ctx switch)              :     195 cycles ,     1630 ns :
+        stack.push.immediate.user                - Add data to k_stack (no ctx switch)                :     714 cycles ,     5956 ns :
+        stack.pop.immediate.user                 - Get data from k_stack (no ctx switch)              :    1009 cycles ,     8414 ns :
+        stack.pop.blocking.k_to_k                - Get data from k_stack (w/ ctx switch)              :    1234 cycles ,    10291 ns :
+        stack.push.wake+ctx.k_to_k               - Add data to k_stack (w/ ctx switch)                :    1360 cycles ,    11333 ns :
+        stack.pop.blocking.u_to_k                - Get data from k_stack (w/ ctx switch)              :    2084 cycles ,    17374 ns :
+        stack.push.wake+ctx.k_to_u               - Add data to k_stack (w/ ctx switch)                :    1665 cycles ,    13875 ns :
+        stack.pop.blocking.k_to_u                - Get data from k_stack (w/ ctx switch)              :    1544 cycles ,    12874 ns :
+        stack.push.wake+ctx.u_to_k               - Add data to k_stack (w/ ctx switch)                :    1850 cycles ,    15422 ns :
+        stack.pop.blocking.u_to_u                - Get data from k_stack (w/ ctx switch)              :    2394 cycles ,    19958 ns :
+        stack.push.wake+ctx.u_to_u               - Add data to k_stack (w/ ctx switch)                :    2155 cycles ,    17958 ns :
         mutex.lock.immediate.recursive.kernel    - Lock a mutex                                       :     155 cycles ,     1291 ns :
         mutex.unlock.immediate.recursive.kernel  - Unlock a mutex                                     :      57 cycles ,      475 ns :
         mutex.lock.immediate.recursive.user      - Lock a mutex                                       :     665 cycles ,     5541 ns :

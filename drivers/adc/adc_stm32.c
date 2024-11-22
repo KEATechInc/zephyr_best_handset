@@ -22,6 +22,7 @@
 #include <zephyr/pm/device.h>
 #include <zephyr/pm/policy.h>
 #include <stm32_ll_adc.h>
+#include <stm32_ll_system.h>
 #if defined(CONFIG_SOC_SERIES_STM32U5X)
 #include <stm32_ll_pwr.h>
 #endif /* CONFIG_SOC_SERIES_STM32U5X */
@@ -46,7 +47,7 @@ LOG_MODULE_REGISTER(adc_stm32);
 #include <zephyr/irq.h>
 #include <zephyr/mem_mgmt/mem_attr.h>
 
-#ifdef CONFIG_SOC_SERIES_STM32H7X
+#if defined(CONFIG_SOC_SERIES_STM32H7X) || defined(CONFIG_SOC_SERIES_STM32H7RSX)
 #include <zephyr/dt-bindings/memory-attr/memory-attr-arm.h>
 #endif
 
@@ -221,12 +222,9 @@ static void adc_stm32_enable_dma_support(ADC_TypeDef *adc)
 
 #if defined(ADC_VER_V5_V90)
 	if (adc == ADC3) {
-		LL_ADC_REG_SetDMATransferMode(adc,
-			ADC3_CFGR_DMACONTREQ(LL_ADC_REG_DMA_TRANSFER_LIMITED));
-		LL_ADC_EnableDMAReq(adc);
+		LL_ADC_REG_SetDMATransferMode(adc, LL_ADC3_REG_DMA_TRANSFER_LIMITED);
 	} else {
-		LL_ADC_REG_SetDataTransferMode(adc,
-			ADC_CFGR_DMACONTREQ(LL_ADC_REG_DMA_TRANSFER_LIMITED));
+		LL_ADC_REG_SetDataTransferMode(adc, LL_ADC_REG_DMA_TRANSFER_LIMITED);
 	}
 #elif defined(ADC_VER_V5_X)
 	LL_ADC_REG_SetDataTransferMode(adc, LL_ADC_REG_DMA_TRANSFER_LIMITED);
@@ -238,7 +236,15 @@ static void adc_stm32_enable_dma_support(ADC_TypeDef *adc)
 
 #error "The STM32F1 ADC + DMA is not yet supported"
 
-#else /* DT_HAS_COMPAT_STATUS_OKAY(st_stm32f1_adc) */
+#elif defined(CONFIG_SOC_SERIES_STM32U5X) /* DT_HAS_COMPAT_STATUS_OKAY(st_stm32f1_adc) */
+
+	if (adc == ADC4) {
+		LL_ADC_REG_SetDMATransfer(adc, LL_ADC_REG_DMA_TRANSFER_LIMITED_ADC4);
+	} else {
+		LL_ADC_REG_SetDataTransferMode(adc, LL_ADC_REG_DMA_TRANSFER_LIMITED);
+	}
+
+#else /* defined(CONFIG_SOC_SERIES_STM32U5X) */
 
 	/* Default mechanism for other MCUs */
 	LL_ADC_REG_SetDMATransfer(adc, LL_ADC_REG_DMA_TRANSFER_LIMITED);
@@ -517,6 +523,7 @@ static void adc_stm32_calibration_start(const struct device *dev)
 	defined(CONFIG_SOC_SERIES_STM32L4X) || \
 	defined(CONFIG_SOC_SERIES_STM32L5X) || \
 	defined(CONFIG_SOC_SERIES_STM32H5X) || \
+	defined(CONFIG_SOC_SERIES_STM32H7RSX) || \
 	defined(CONFIG_SOC_SERIES_STM32WBX) || \
 	defined(CONFIG_SOC_SERIES_STM32G4X)
 	LL_ADC_StartCalibration(adc, LL_ADC_SINGLE_ENDED);
@@ -529,6 +536,24 @@ static void adc_stm32_calibration_start(const struct device *dev)
 	defined(CONFIG_SOC_SERIES_STM32WBAX)
 	LL_ADC_StartCalibration(adc);
 #elif defined(CONFIG_SOC_SERIES_STM32U5X)
+	if (adc != ADC4) {
+		uint32_t dev_id = LL_DBGMCU_GetDeviceID();
+		uint32_t rev_id = LL_DBGMCU_GetRevisionID();
+
+		/* Some U5 implement an extended calibration to enhance ADC performance.
+		 * It is not available for ADC4.
+		 * It is available on all U5 except U575/585 (dev ID 482) revision X (rev ID 2001).
+		 * The code below applies the procedure described in RM0456 in the ADC chapter:
+		 * "Extended calibration mode"
+		 */
+		if ((dev_id != 0x482UL) && (rev_id != 0x2001UL)) {
+			adc_stm32_enable(adc);
+			MODIFY_REG(adc->CR, ADC_CR_CALINDEX, 0x9UL << ADC_CR_CALINDEX_Pos);
+			MODIFY_REG(adc->CALFACT2, 0xFFFFFF00UL, 0x03021100UL);
+			SET_BIT(adc->CALFACT, ADC_CALFACT_LATCH_COEF);
+			adc_stm32_disable(adc);
+		}
+	}
 	LL_ADC_StartCalibration(adc, LL_ADC_CALIB_OFFSET);
 #elif defined(CONFIG_SOC_SERIES_STM32H7X)
 	LL_ADC_StartCalibration(adc, LL_ADC_CALIB_OFFSET, LL_ADC_SINGLE_ENDED);
@@ -546,6 +571,24 @@ static int adc_stm32_calibrate(const struct device *dev)
 		(const struct adc_stm32_cfg *)dev->config;
 	ADC_TypeDef *adc = config->base;
 	int err;
+
+#if defined(CONFIG_ADC_STM32_DMA)
+#if defined(CONFIG_SOC_SERIES_STM32C0X) || \
+	defined(CONFIG_SOC_SERIES_STM32F0X) || \
+	defined(CONFIG_SOC_SERIES_STM32G0X) || \
+	defined(CONFIG_SOC_SERIES_STM32H7RSX) || \
+	defined(CONFIG_SOC_SERIES_STM32L0X) || \
+	defined(CONFIG_SOC_SERIES_STM32WBAX) || \
+	defined(CONFIG_SOC_SERIES_STM32WLX)
+	/* Make sure DMA is disabled before starting calibration */
+	LL_ADC_REG_SetDMATransfer(adc, LL_ADC_REG_DMA_TRANSFER_NONE);
+#elif defined(CONFIG_SOC_SERIES_STM32U5X)
+	if (adc == ADC4) {
+		/* Make sure DMA is disabled before starting calibration */
+		LL_ADC_REG_SetDMATransfer(adc, LL_ADC_REG_DMA_TRANSFER_NONE);
+	}
+#endif /* CONFIG_SOC_SERIES_* */
+#endif /* CONFIG_ADC_STM32_DMA */
 
 #if !DT_HAS_COMPAT_STATUS_OKAY(st_stm32f1_adc)
 	adc_stm32_disable(adc);
@@ -584,6 +627,7 @@ static int adc_stm32_calibrate(const struct device *dev)
 		linear_calib_buffer = *(uint32_t *)(
 			ADC_LINEAR_CALIB_REG_1_ADDR + channel_offset + count
 		);
+
 		LL_ADC_SetCalibrationLinearFactor(
 			adc, LL_ADC_CALIB_LINEARITY_WORD1 << count,
 			linear_calib_buffer
@@ -641,11 +685,14 @@ static const uint32_t table_oversampling_ratio[] = {
  */
 static void adc_stm32_oversampling_scope(ADC_TypeDef *adc, uint32_t ovs_scope)
 {
-#if defined(CONFIG_SOC_SERIES_STM32L0X) || \
+#if defined(CONFIG_SOC_SERIES_STM32G0X) || \
+	defined(CONFIG_SOC_SERIES_STM32L0X) || \
 	defined(CONFIG_SOC_SERIES_STM32WLX)
 	/*
-	 * setting OVS bits is conditioned to ADC state: ADC must be disabled
-	 * or enabled without conversion on going : disable it, it will stop
+	 * Setting OVS bits is conditioned to ADC state: ADC must be disabled
+	 * or enabled without conversion on going : disable it, it will stop.
+	 * For the G0 series, ADC must be disabled to prevent CKMODE bitfield
+	 * from getting reset, see errata ES0418 section 2.6.4.
 	 */
 	if (LL_ADC_GetOverSamplingScope(adc) == ovs_scope) {
 		return;
@@ -1400,6 +1447,7 @@ static int adc_stm32_init(const struct device *dev)
 	defined(CONFIG_SOC_SERIES_STM32G4X) || \
 	defined(CONFIG_SOC_SERIES_STM32H5X) || \
 	defined(CONFIG_SOC_SERIES_STM32H7X) || \
+	defined(CONFIG_SOC_SERIES_STM32H7RSX) || \
 	defined(CONFIG_SOC_SERIES_STM32U5X)
 	/*
 	 * L4, WB, G4, H5, H7 and U5 series STM32 needs to be awaken from deep sleep
@@ -1417,7 +1465,28 @@ static int adc_stm32_init(const struct device *dev)
 	!DT_HAS_COMPAT_STATUS_OKAY(st_stm32f1_adc) && \
 	!DT_HAS_COMPAT_STATUS_OKAY(st_stm32f4_adc)
 	LL_ADC_EnableInternalRegulator(adc);
+	/* Wait for Internal regulator stabilisation
+	 * Some series have a dedicated status bit, others relie on a delay
+	 */
+#if defined(CONFIG_SOC_SERIES_STM32H7X) && defined(ADC_VER_V5_V90)
+	/* ADC3 on H72x/H73x doesn't have the LDORDY status bit */
+	if (adc == ADC3) {
+		k_busy_wait(LL_ADC_DELAY_INTERNAL_REGUL_STAB_US);
+	} else {
+		while (LL_ADC_IsActiveFlag_LDORDY(adc) == 0) {
+		}
+	}
+#elif defined(CONFIG_SOC_SERIES_STM32H7X) || \
+	defined(CONFIG_SOC_SERIES_STM32U5X) || \
+	defined(CONFIG_SOC_SERIES_STM32WBAX)
+	/* Don't use LL_ADC_IsActiveFlag_LDORDY since not present in U5 LL (1.5.0)
+	 * (internal issue 185106)
+	 */
+	while ((READ_BIT(adc->ISR, LL_ADC_FLAG_LDORDY) != (LL_ADC_FLAG_LDORDY))) {
+	}
+#else
 	k_busy_wait(LL_ADC_DELAY_INTERNAL_REGUL_STAB_US);
+#endif
 #endif
 
 	if (config->irq_cfg_func) {
@@ -1460,6 +1529,7 @@ static int adc_stm32_suspend_setup(const struct device *dev)
 	defined(CONFIG_SOC_SERIES_STM32G4X) || \
 	defined(CONFIG_SOC_SERIES_STM32H5X) || \
 	defined(CONFIG_SOC_SERIES_STM32H7X) || \
+	defined(CONFIG_SOC_SERIES_STM32H7RSX) || \
 	defined(CONFIG_SOC_SERIES_STM32U5X)
 	/*
 	 * L4, WB, G4, H5, H7 and U5 series STM32 needs to be put into
@@ -1550,7 +1620,7 @@ static const struct adc_driver_api api_stm32_driver_api = {
 #define ADC_DMA_CHANNEL_INIT(index, src_dev, dest_dev)					\
 	.dma = {									\
 		.dma_dev = DEVICE_DT_GET(DT_INST_DMAS_CTLR_BY_IDX(index, 0)),		\
-		.channel = STM32_DMA_SLOT_BY_IDX(index, 0, channel),			\
+		.channel = DT_INST_DMAS_CELL_BY_IDX(index, 0, channel),			\
 		.dma_cfg = {								\
 			.dma_slot = STM32_DMA_SLOT_BY_IDX(index, 0, slot),		\
 			.channel_direction = STM32_DMA_CONFIG_DIRECTION(		\
@@ -1675,6 +1745,8 @@ DT_INST_FOREACH_STATUS_OKAY(GENERATE_ISR)
 #define ADC_STM32_IRQ_FUNC(index)                                                                  \
 	.irq_cfg_func = COND_CODE_1(IS_EQ(index, FIRST_WITH_IRQN(index)),                          \
 				    (UTIL_CAT(ISR_FUNC(index), _init)), (NULL)),
+
+#define ADC_DMA_CHANNEL_INIT(index, src_dev, dest_dev)
 
 #endif /* CONFIG_ADC_STM32_DMA */
 

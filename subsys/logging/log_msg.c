@@ -57,8 +57,10 @@ static bool frontend_runtime_filtering(const void *source, uint32_t level)
 		return true;
 	}
 
-	/* If only frontend is used and log got here it means that it was accepted. */
-	if (IS_ENABLED(CONFIG_LOG_FRONTEND_ONLY)) {
+	/* If only frontend is used and log got here it means that it was accepted
+	 * unless userspace is enabled then runtime filtering is done here.
+	 */
+	if (!IS_ENABLED(CONFIG_USERSPACE) && IS_ENABLED(CONFIG_LOG_FRONTEND_ONLY)) {
 		return true;
 	}
 
@@ -93,11 +95,13 @@ static void z_log_msg_simple_create(const void *source, uint32_t level, uint32_t
 	/* Package length (in words) is increased by the header. */
 	size_t plen32 = len + CBPRINTF_DESC_SIZE32;
 	/* Package length in bytes. */
-	size_t plen8 = sizeof(uint32_t) * plen32;
+	size_t plen8 = sizeof(uint32_t) * plen32 +
+			(IS_ENABLED(CONFIG_LOG_MSG_APPEND_RO_STRING_LOC) ? 1 : 0);
 	struct log_msg *msg = z_log_msg_alloc(Z_LOG_MSG_ALIGNED_WLEN(plen8, 0));
 	union cbprintf_package_hdr package_hdr = {
 		.desc = {
-			.len = plen32
+			.len = plen32,
+			.ro_str_cnt = IS_ENABLED(CONFIG_LOG_MSG_APPEND_RO_STRING_LOC) ? 1 : 0
 		}
 	};
 
@@ -108,6 +112,10 @@ static void z_log_msg_simple_create(const void *source, uint32_t level, uint32_t
 		for (size_t i = 0; i < len; i++) {
 			*package++ = data[i];
 		}
+		if (IS_ENABLED(CONFIG_LOG_MSG_APPEND_RO_STRING_LOC)) {
+			/* fmt string located at index 1 */
+			*(uint8_t *)package = 1;
+		}
 	}
 
 	struct log_msg_desc desc = {
@@ -117,7 +125,6 @@ static void z_log_msg_simple_create(const void *source, uint32_t level, uint32_t
 	};
 
 	z_log_msg_finalize(msg, source, desc, NULL);
-
 }
 
 void z_impl_z_log_msg_simple_create_0(const void *source, uint32_t level, const char *fmt)
@@ -133,20 +140,30 @@ void z_impl_z_log_msg_simple_create_0(const void *source, uint32_t level, const 
 			uint32_t plen32 = CBPRINTF_DESC_SIZE32 + 1;
 			union cbprintf_package_hdr hdr = {
 				.desc = {
-					.len = plen32
+					.len = plen32,
+					.ro_str_cnt =
+					   IS_ENABLED(CONFIG_LOG_MSG_APPEND_RO_STRING_LOC) ? 1 : 0
 				}
 			};
-			uint32_t package[] = {
-				(uint32_t)(uintptr_t)hdr.raw,
-				(uint32_t)(uintptr_t)fmt,
-			};
+			uint8_t package[sizeof(uint32_t) * (CBPRINTF_DESC_SIZE32 + 1) +
+				(IS_ENABLED(CONFIG_LOG_MSG_APPEND_RO_STRING_LOC) ? 1 : 0)]
+				__aligned(sizeof(uint32_t));
+			uint32_t *p32 = (uint32_t *)package;
+
+			*p32++ = (uint32_t)(uintptr_t)hdr.raw;
+			*p32++ = (uint32_t)(uintptr_t)fmt;
+			if (IS_ENABLED(CONFIG_LOG_MSG_APPEND_RO_STRING_LOC)) {
+				/* fmt string located at index 1 */
+				*(uint8_t *)p32 = 1;
+			}
+
 			struct log_msg_desc desc = {
 				.level = level,
-				.package_len = plen32 * sizeof(uint32_t),
+				.package_len = sizeof(package),
 				.data_len = 0,
 			};
 
-			log_frontend_msg(source, desc, (uint8_t *)package, NULL);
+			log_frontend_msg(source, desc, package, NULL);
 		}
 	}
 
@@ -172,21 +189,31 @@ void z_impl_z_log_msg_simple_create_1(const void *source, uint32_t level,
 			uint32_t plen32 = CBPRINTF_DESC_SIZE32 + 2;
 			union cbprintf_package_hdr hdr = {
 				.desc = {
-					.len = plen32
+					.len = plen32,
+					.ro_str_cnt =
+					   IS_ENABLED(CONFIG_LOG_MSG_APPEND_RO_STRING_LOC) ? 1 : 0
 				}
 			};
-			uint32_t package[] = {
-				(uint32_t)(uintptr_t)hdr.raw,
-				(uint32_t)(uintptr_t)fmt,
-				arg
-			};
+			uint8_t package[sizeof(uint32_t) * (CBPRINTF_DESC_SIZE32 + 2) +
+				(IS_ENABLED(CONFIG_LOG_MSG_APPEND_RO_STRING_LOC) ? 1 : 0)]
+				__aligned(sizeof(uint32_t));
+			uint32_t *p32 = (uint32_t *)package;
+
+			*p32++ = (uint32_t)(uintptr_t)hdr.raw;
+			*p32++ = (uint32_t)(uintptr_t)fmt;
+			*p32++ = arg;
+			if (IS_ENABLED(CONFIG_LOG_MSG_APPEND_RO_STRING_LOC)) {
+				/* fmt string located at index 1 */
+				*(uint8_t *)p32 = 1;
+			}
+
 			struct log_msg_desc desc = {
 				.level = level,
-				.package_len = plen32 * sizeof(uint32_t),
+				.package_len = sizeof(package),
 				.data_len = 0,
 			};
 
-			log_frontend_msg(source, desc, (uint8_t *)package, NULL);
+			log_frontend_msg(source, desc, package, NULL);
 		}
 	}
 
@@ -212,22 +239,32 @@ void z_impl_z_log_msg_simple_create_2(const void *source, uint32_t level,
 			uint32_t plen32 = CBPRINTF_DESC_SIZE32 + 3;
 			union cbprintf_package_hdr hdr = {
 				.desc = {
-					.len = plen32
+					.len = plen32,
+					.ro_str_cnt =
+					   IS_ENABLED(CONFIG_LOG_MSG_APPEND_RO_STRING_LOC) ? 1 : 0
 				}
 			};
-			uint32_t package[] = {
-				[0](uint32_t)(uintptr_t)hdr.raw,
-				(uint32_t)(uintptr_t)fmt,
-				arg0,
-				arg1
-			};
+			uint8_t package[sizeof(uint32_t) * (CBPRINTF_DESC_SIZE32 + 3) +
+				(IS_ENABLED(CONFIG_LOG_MSG_APPEND_RO_STRING_LOC) ? 1 : 0)]
+				__aligned(sizeof(uint32_t));
+			uint32_t *p32 = (uint32_t *)package;
+
+			*p32++ = (uint32_t)(uintptr_t)hdr.raw;
+			*p32++ = (uint32_t)(uintptr_t)fmt;
+			*p32++ = arg0;
+			*p32++ = arg1;
+			if (IS_ENABLED(CONFIG_LOG_MSG_APPEND_RO_STRING_LOC)) {
+				/* fmt string located at index 1 */
+				*(uint8_t *)p32 = 1;
+			}
+
 			struct log_msg_desc desc = {
 				.level = level,
-				.package_len = plen32 * sizeof(uint32_t),
+				.package_len = sizeof(package),
 				.data_len = 0,
 			};
 
-			log_frontend_msg(source, desc, (uint8_t *)package, NULL);
+			log_frontend_msg(source, desc, package, NULL);
 		}
 	}
 
@@ -258,6 +295,8 @@ void z_impl_z_log_msg_static_create(const void *source,
 
 	if (inlen > 0) {
 		uint32_t flags = CBPRINTF_PACKAGE_CONVERT_RW_STR |
+				 (IS_ENABLED(CONFIG_LOG_MSG_APPEND_RO_STRING_LOC) ?
+				 CBPRINTF_PACKAGE_CONVERT_KEEP_RO_STR : 0) |
 				 (IS_ENABLED(CONFIG_LOG_FMT_SECTION_STRIP) ?
 				 0 : CBPRINTF_PACKAGE_CONVERT_PTR_CHECK);
 		uint16_t strl[4];
@@ -292,7 +331,6 @@ void z_impl_z_log_msg_static_create(const void *source,
 
 	z_log_msg_finalize(msg, source, out_desc, data);
 }
-EXPORT_SYSCALL(z_log_msg_static_create);
 
 #ifdef CONFIG_USERSPACE
 static inline void z_vrfy_z_log_msg_static_create(const void *source,
@@ -301,7 +339,7 @@ static inline void z_vrfy_z_log_msg_static_create(const void *source,
 {
 	return z_impl_z_log_msg_static_create(source, desc, package, data);
 }
-#include <syscalls/z_log_msg_static_create_mrsh.c>
+#include <zephyr/syscalls/z_log_msg_static_create_mrsh.c>
 #endif
 
 void z_log_msg_runtime_vcreate(uint8_t domain_id, const void *source,
@@ -320,6 +358,12 @@ void z_log_msg_runtime_vcreate(uint8_t domain_id, const void *source,
 		va_end(ap2);
 	} else {
 		plen = 0;
+	}
+
+	if (plen > Z_LOG_MSG_MAX_PACKAGE) {
+		LOG_WRN("Message dropped because it exceeds size limitation (%u)",
+			(uint32_t)Z_LOG_MSG_MAX_PACKAGE);
+		return;
 	}
 
 	size_t msg_wlen = Z_LOG_MSG_ALIGNED_WLEN(plen, dlen);
@@ -352,4 +396,22 @@ void z_log_msg_runtime_vcreate(uint8_t domain_id, const void *source,
 	if (BACKENDS_IN_USE()) {
 		z_log_msg_finalize(msg, source, desc, data);
 	}
+}
+
+int16_t log_msg_get_source_id(struct log_msg *msg)
+{
+	if (!z_log_is_local_domain(log_msg_get_domain(msg))) {
+		/* Remote domain is converting source pointer to ID */
+		return (int16_t)(uintptr_t)log_msg_get_source(msg);
+	}
+
+	void *source = (void *)log_msg_get_source(msg);
+
+	if (source != NULL) {
+		return IS_ENABLED(CONFIG_LOG_RUNTIME_FILTERING)
+					? log_dynamic_source_id(source)
+					: log_const_source_id(source);
+	}
+
+	return -1;
 }

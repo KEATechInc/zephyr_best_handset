@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2021, NXP
+ * Copyright 2021,2024 NXP
  *
  * SPDX-License-Identifier: Apache-2.0
  */
@@ -20,6 +20,10 @@ static int mcux_ccm_on(const struct device *dev,
 #ifdef CONFIG_ETH_NXP_ENET
 	if ((uint32_t)sub_system == IMX_CCM_ENET_CLK) {
 		CLOCK_EnableClock(kCLOCK_Enet);
+#ifdef CONFIG_ETH_NXP_ENET_1G
+	} else if ((uint32_t)sub_system == IMX_CCM_ENET1G_CLK) {
+		CLOCK_EnableClock(kCLOCK_Enet_1g);
+#endif
 	}
 #endif
 	return 0;
@@ -111,11 +115,12 @@ static int mcux_ccm_get_subsys_rate(const struct device *dev,
 
 #ifdef CONFIG_ETH_NXP_ENET
 	case IMX_CCM_ENET_CLK:
+	case IMX_CCM_ENET1G_CLK:
 		clock_root = kCLOCK_Root_Bus;
 		break;
 #endif
 
-#if defined(CONFIG_SOC_MIMX93_A55) && defined(CONFIG_DAI_NXP_SAI)
+#if defined(CONFIG_SOC_MIMX9352_A55) && defined(CONFIG_DAI_NXP_SAI)
 	case IMX_CCM_SAI1_CLK:
 	case IMX_CCM_SAI2_CLK:
 	case IMX_CCM_SAI3_CLK:
@@ -133,6 +138,21 @@ static int mcux_ccm_get_subsys_rate(const struct device *dev,
 
 		return 0;
 #endif
+#ifdef CONFIG_COUNTER_MCUX_TPM
+	case IMX_CCM_TPM_CLK:
+		clock_root = kCLOCK_Root_Tpm1 + instance;
+		break;
+#endif
+
+#ifdef CONFIG_PWM_MCUX_QTMR
+	case IMX_CCM_QTMR1_CLK:
+	case IMX_CCM_QTMR2_CLK:
+	case IMX_CCM_QTMR3_CLK:
+	case IMX_CCM_QTMR4_CLK:
+		clock_root = kCLOCK_Root_Bus;
+		break;
+#endif
+
 #ifdef CONFIG_MEMC_MCUX_FLEXSPI
 	case IMX_CCM_FLEXSPI_CLK:
 		clock_root = kCLOCK_Root_Flexspi1;
@@ -141,10 +161,21 @@ static int mcux_ccm_get_subsys_rate(const struct device *dev,
 		clock_root = kCLOCK_Root_Flexspi2;
 		break;
 #endif
+#ifdef CONFIG_COUNTER_NXP_PIT
+	case IMX_CCM_PIT_CLK:
+		clock_root = kCLOCK_Root_Bus + instance;
+		break;
+#endif
+
+#ifdef CONFIG_ADC_MCUX_LPADC
+	case IMX_CCM_LPADC1_CLK:
+		clock_root = kCLOCK_Root_Adc1 + instance;
+		break;
+#endif
 	default:
 		return -EINVAL;
 	}
-#ifdef CONFIG_SOC_MIMX93_A55
+#ifdef CONFIG_SOC_MIMX9352_A55
 	*rate = CLOCK_GetIpFreq(clock_root);
 #else
 	*rate = CLOCK_GetRootClockFreq(clock_root);
@@ -173,7 +204,7 @@ static int CCM_SET_FUNC_ATTR mcux_ccm_set_subsys_rate(const struct device *dev,
 	case IMX_CCM_FLEXSPI_CLK:
 		__fallthrough;
 	case IMX_CCM_FLEXSPI2_CLK:
-#if defined(CONFIG_SOC_SERIES_IMX_RT11XX) && defined(CONFIG_MEMC_MCUX_FLEXSPI)
+#if defined(CONFIG_SOC_SERIES_IMXRT11XX) && defined(CONFIG_MEMC_MCUX_FLEXSPI)
 		/* The SOC is using the FlexSPI for XIP. Therefore,
 		 * the FlexSPI itself must be managed within the function,
 		 * which is SOC specific.

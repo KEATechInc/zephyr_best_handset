@@ -29,11 +29,11 @@ static struct k_spinlock pthread_key_lock;
  * perspective of the application). With a linear space, this means that
  * the theoretical pthread_key_t range is [0,2147483647].
  */
-BUILD_ASSERT(CONFIG_MAX_PTHREAD_KEY_COUNT < PTHREAD_OBJ_MASK_INIT,
+BUILD_ASSERT(CONFIG_POSIX_THREAD_KEYS_MAX < PTHREAD_OBJ_MASK_INIT,
 	     "CONFIG_MAX_PTHREAD_KEY_COUNT is too high");
 
-static pthread_key_obj posix_key_pool[CONFIG_MAX_PTHREAD_KEY_COUNT];
-SYS_BITARRAY_DEFINE_STATIC(posix_key_bitarray, CONFIG_MAX_PTHREAD_KEY_COUNT);
+static pthread_key_obj posix_key_pool[CONFIG_POSIX_THREAD_KEYS_MAX];
+SYS_BITARRAY_DEFINE_STATIC(posix_key_bitarray, CONFIG_POSIX_THREAD_KEYS_MAX);
 
 static inline size_t posix_key_to_offset(pthread_key_obj *k)
 {
@@ -52,19 +52,19 @@ static pthread_key_obj *get_posix_key(pthread_key_t key)
 
 	/* if the provided cond does not claim to be initialized, its invalid */
 	if (!is_pthread_obj_initialized(key)) {
-		LOG_ERR("Key is uninitialized (%x)", key);
+		LOG_DBG("Key is uninitialized (%x)", key);
 		return NULL;
 	}
 
 	/* Mask off the MSB to get the actual bit index */
 	if (sys_bitarray_test_bit(&posix_key_bitarray, bit, &actually_initialized) < 0) {
-		LOG_ERR("Key is invalid (%x)", key);
+		LOG_DBG("Key is invalid (%x)", key);
 		return NULL;
 	}
 
 	if (actually_initialized == 0) {
 		/* The cond claims to be initialized but is actually not */
-		LOG_ERR("Key claims to be initialized (%x)", key);
+		LOG_DBG("Key claims to be initialized (%x)", key);
 		return NULL;
 	}
 
@@ -200,25 +200,25 @@ int pthread_setspecific(pthread_key_t key, const void *value)
 
 	SYS_SLIST_FOR_EACH_NODE(&(thread->key_list), node_l) {
 
-			thread_spec_data = (pthread_thread_data *)node_l;
+		thread_spec_data = (pthread_thread_data *)node_l;
 
-			if (thread_spec_data->key == key_obj) {
+		if (thread_spec_data->key == key_obj) {
 
-				/* Key is already present so
-				 * associate thread specific data
-				 */
-				thread_spec_data->spec_data = (void *)value;
-				LOG_DBG("Paired key %x to value %p for thread %x", key, value,
-					pthread_self());
-				goto out;
-			}
+			/* Key is already present so
+			 * associate thread specific data
+			 */
+			thread_spec_data->spec_data = (void *)value;
+			LOG_DBG("Paired key %x to value %p for thread %x", key, value,
+				pthread_self());
+			goto out;
+		}
 	}
 
 	if (node_l == NULL) {
 		key_data = k_malloc(sizeof(struct pthread_key_data));
 
 		if (key_data == NULL) {
-			LOG_ERR("Failed to allocate key data for key %x", key);
+			LOG_DBG("Failed to allocate key data for key %x", key);
 			retval = ENOMEM;
 			goto out;
 		}

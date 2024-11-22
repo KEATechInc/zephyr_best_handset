@@ -28,6 +28,10 @@ LOG_MODULE_REGISTER(net_dhcpv4, CONFIG_NET_DHCPV4_LOG_LEVEL);
 #include <zephyr/net/dhcpv4.h>
 #include <zephyr/net/dns_resolve.h>
 
+#include <zephyr/logging/log_backend.h>
+#include <zephyr/logging/log_backend_net.h>
+#include <zephyr/logging/log_ctrl.h>
+
 #include "dhcpv4_internal.h"
 #include "ipv4.h"
 #include "net_stats.h"
@@ -42,11 +46,34 @@ static K_MUTEX_DEFINE(lock);
 static sys_slist_t dhcpv4_ifaces;
 static struct k_work_delayable timeout_work;
 
-static struct net_mgmt_event_callback mgmt4_cb;
+static struct net_mgmt_event_callback mgmt4_if_cb;
+#if defined(CONFIG_NET_IPV4_ACD)
+static struct net_mgmt_event_callback mgmt4_acd_cb;
+#endif
 
 #if defined(CONFIG_NET_DHCPV4_OPTION_CALLBACKS)
-static sys_slist_t option_callbacks;
+static sys_slist_t option_callbacks = SYS_SLIST_STATIC_INIT(&option_callbacks);
+static int unique_types_in_callbacks;
 #endif
+
+#if defined(CONFIG_NET_DHCPV4_OPTION_CALLBACKS_VENDOR_SPECIFIC)
+static sys_slist_t option_vendor_callbacks = SYS_SLIST_STATIC_INIT(&option_vendor_callbacks);
+#endif
+
+static const uint8_t min_req_options[] = {
+	DHCPV4_OPTIONS_SUBNET_MASK,
+	DHCPV4_OPTIONS_ROUTER,
+#ifdef CONFIG_LOG_BACKEND_NET_USE_DHCPV4_OPTION
+	DHCPV4_OPTIONS_LOG_SERVER,
+#endif
+#ifdef CONFIG_NET_DHCPV4_OPTION_NTP_SERVER
+	DHCPV4_OPTIONS_NTP_SERVER,
+#endif
+#ifdef CONFIG_NET_DHCPV4_OPTION_CALLBACKS_VENDOR_SPECIFIC
+	DHCPV4_OPTIONS_VENDOR_SPECIFIC,
+#endif
+	DHCPV4_OPTIONS_DNS_SERVER
+};
 
 /* RFC 1497 [17] */
 static const uint8_t magic_cookie[4] = { 0x63, 0x82, 0x53, 0x63 };
@@ -61,6 +88,47 @@ static inline bool dhcpv4_add_cookie(struct net_pkt *pkt)
 
 	return true;
 }
+
+#if defined(CONFIG_NET_DHCPV4_OPTION_CALLBACKS)
+static void dhcpv4_option_callback_get_unique_types(uint8_t *types)
+{
+	struct net_dhcpv4_option_callback *cb, *tmp;
+	int count = ARRAY_SIZE(min_req_options);
+	bool found = false;
+
+	memcpy(types, min_req_options, ARRAY_SIZE(min_req_options));
+
+	SYS_SLIST_FOR_EACH_CONTAINER_SAFE(&option_callbacks, cb, tmp, node) {
+		for (int j = 0; j < count; j++) {
+			if (types[j] == cb->option) {
+				found = true;
+				break;
+			}
+		}
+
+		if (!found) {
+			if (count >= CONFIG_NET_DHCPV4_MAX_REQUESTED_OPTIONS) {
+				NET_ERR("Too many unique options in callbacks, cannot request "
+					"option %d",
+					cb->option);
+				continue;
+			}
+			types[count] = cb->option;
+			count++;
+		} else {
+			found = false;
+		}
+	}
+	unique_types_in_callbacks = count - ARRAY_SIZE(min_req_options);
+}
+
+static void dhcpv4_option_callback_count(void)
+{
+	uint8_t types[CONFIG_NET_DHCPV4_MAX_REQUESTED_OPTIONS];
+
+	dhcpv4_option_callback_get_unique_types(types);
+}
+#endif	/* CONFIG_NET_DHCPV4_OPTION_CALLBACKS */
 
 /* Add a an option with the form OPTION LENGTH VALUE.  */
 static bool dhcpv4_add_option_length_value(struct net_pkt *pkt, uint8_t option,
@@ -87,12 +155,17 @@ static bool dhcpv4_add_msg_type(struct net_pkt *pkt, uint8_t type)
  */
 static bool dhcpv4_add_req_options(struct net_pkt *pkt)
 {
-	static uint8_t data[3] = { DHCPV4_OPTIONS_SUBNET_MASK,
-				DHCPV4_OPTIONS_ROUTER,
-				DHCPV4_OPTIONS_DNS_SERVER };
+#ifdef CONFIG_NET_DHCPV4_OPTION_CALLBACKS
+	uint8_t data[CONFIG_NET_DHCPV4_MAX_REQUESTED_OPTIONS];
+
+	dhcpv4_option_callback_get_unique_types(data);
 
 	return dhcpv4_add_option_length_value(pkt, DHCPV4_OPTIONS_REQ_LIST,
-					      ARRAY_SIZE(data), data);
+		unique_types_in_callbacks + ARRAY_SIZE(min_req_options), data);
+#else
+	return dhcpv4_add_option_length_value(pkt, DHCPV4_OPTIONS_REQ_LIST,
+					      ARRAY_SIZE(min_req_options), min_req_options);
+#endif
 }
 
 static bool dhcpv4_add_server_id(struct net_pkt *pkt,
@@ -118,7 +191,16 @@ static bool dhcpv4_add_hostname(struct net_pkt *pkt,
 }
 #endif
 
-/* Add DHCPv4 Options end, rest of the message can be padded wit zeros */
+#if defined(CONFIG_NET_DHCPV4_VENDOR_CLASS_IDENTIFIER)
+static bool dhcpv4_add_vendor_class_id(struct net_pkt *pkt,
+				 const char *vendor_class_id, const size_t size)
+{
+	return dhcpv4_add_option_length_value(pkt, DHCPV4_OPTIONS_VENDOR_CLASS_ID,
+					      size, vendor_class_id);
+}
+#endif
+
+/* Add DHCPv4 Options end, rest of the message can be padded with zeros */
 static inline bool dhcpv4_add_end(struct net_pkt *pkt)
 {
 	if (net_pkt_write_u8(pkt, DHCPV4_OPTIONS_END)) {
@@ -164,6 +246,10 @@ static struct net_pkt *dhcpv4_create_message(struct net_if *iface, uint8_t type,
 	const char *hostname = net_hostname_get();
 	const size_t hostname_size = strlen(hostname);
 #endif
+#if defined(CONFIG_NET_DHCPV4_VENDOR_CLASS_IDENTIFIER)
+	const char vendor_class_id[] = CONFIG_NET_DHCPV4_VENDOR_CLASS_IDENTIFIER_STRING;
+	const size_t vendor_class_id_size = sizeof(vendor_class_id) - 1;
+#endif
 
 	if (src_addr == NULL) {
 		addr = net_ipv4_unspecified_address();
@@ -180,12 +266,21 @@ static struct net_pkt *dhcpv4_create_message(struct net_if *iface, uint8_t type,
 	}
 
 	if (type == NET_DHCPV4_MSG_TYPE_DISCOVER) {
-		size +=  DHCPV4_OLV_MSG_REQ_LIST;
+		size +=  DHCPV4_OLV_MSG_REQ_LIST + ARRAY_SIZE(min_req_options);
+#if defined(CONFIG_NET_DHCPV4_OPTION_CALLBACKS)
+		size += unique_types_in_callbacks;
+#endif
 	}
 
 #if defined(CONFIG_NET_HOSTNAME_ENABLE)
 	if (hostname_size > 0) {
 		size += DHCPV4_OLV_MSG_HOST_NAME + hostname_size;
+	}
+#endif
+
+#if defined(CONFIG_NET_DHCPV4_VENDOR_CLASS_IDENTIFIER)
+	if (vendor_class_id_size > 0) {
+		size += DHCPV4_OLV_MSG_VENDOR_CLASS_ID + vendor_class_id_size;
 	}
 #endif
 
@@ -254,6 +349,13 @@ static struct net_pkt *dhcpv4_create_message(struct net_if *iface, uint8_t type,
 	}
 #endif
 
+#if defined(CONFIG_NET_DHCPV4_VENDOR_CLASS_IDENTIFIER)
+	if (vendor_class_id_size > 0 &&
+	     !dhcpv4_add_vendor_class_id(pkt, vendor_class_id, vendor_class_id_size)) {
+		goto fail;
+	}
+#endif
+
 	if (!dhcpv4_add_end(pkt)) {
 		goto fail;
 	}
@@ -284,7 +386,7 @@ static void dhcpv4_immediate_timeout(struct net_if_dhcpv4 *dhcpv4)
 static void dhcpv4_set_timeout(struct net_if_dhcpv4 *dhcpv4,
 			       uint32_t timeout)
 {
-	NET_DBG("sched timeout dhcvp4=%p timeout=%us", dhcpv4, timeout);
+	NET_DBG("sched timeout dhcpv4=%p timeout=%us", dhcpv4, timeout);
 	dhcpv4->timer_start = k_uptime_get();
 	dhcpv4->request_time = timeout;
 
@@ -293,6 +395,64 @@ static void dhcpv4_set_timeout(struct net_if_dhcpv4 *dhcpv4,
 	 * event.  Delegate scheduling to the timeout manager.
 	 */
 	k_work_reschedule(&timeout_work, K_NO_WAIT);
+}
+
+/* Set a new timeout w/o updating base time. Used for RENEWING and REBINDING to
+ * keep track of T1/T2/lease timeouts.
+ */
+static void dhcpv4_set_timeout_inc(struct net_if_dhcpv4 *dhcpv4,
+				   int64_t now, uint32_t timeout)
+{
+	int64_t timeout_ms;
+
+	NET_DBG("sched timeout dhcpv4=%p timeout=%us", dhcpv4, timeout);
+
+	timeout_ms = (now - dhcpv4->timer_start) + MSEC_PER_SEC * timeout;
+	dhcpv4->request_time = (uint32_t)(timeout_ms / MSEC_PER_SEC);
+}
+
+static uint32_t dhcpv4_get_timeleft(int64_t start, uint32_t time, int64_t now)
+{
+	int64_t deadline = start + MSEC_PER_SEC * time;
+	uint32_t ret = 0U;
+
+	/* If we haven't reached the deadline, calculate the
+	 * rounded-up whole seconds until the deadline.
+	 */
+	if (deadline > now) {
+		ret = (uint32_t)DIV_ROUND_UP(deadline - now, MSEC_PER_SEC);
+	}
+
+	return ret;
+}
+
+static uint32_t dhcpv4_request_timeleft(struct net_if *iface, int64_t now)
+{
+	uint32_t request_time = iface->config.dhcpv4.request_time;
+
+	return dhcpv4_get_timeleft(iface->config.dhcpv4.timer_start,
+				   request_time, now);
+}
+
+static uint32_t dhcpv4_renewal_timeleft(struct net_if *iface, int64_t now)
+{
+	return dhcpv4_get_timeleft(iface->config.dhcpv4.timer_start,
+				   iface->config.dhcpv4.renewal_time,
+				   now);
+}
+
+static uint32_t dhcpv4_rebinding_timeleft(struct net_if *iface, int64_t now)
+{
+	return dhcpv4_get_timeleft(iface->config.dhcpv4.timer_start,
+				   iface->config.dhcpv4.rebinding_time,
+				   now);
+}
+
+static uint32_t dhcpv4_lease_timeleft(struct net_if *iface, int64_t now)
+{
+	return dhcpv4_get_timeleft(iface->config.dhcpv4.timer_start,
+				   iface->config.dhcpv4.lease_time,
+				   now);
 }
 
 /* Must be invoked with lock held */
@@ -308,10 +468,63 @@ static uint32_t dhcpv4_update_message_timeout(struct net_if_dhcpv4 *dhcpv4)
 	}
 
 	/* +1/-1 second randomization */
-	timeout += (sys_rand32_get() % 3U) - 1;
+	timeout += (sys_rand8_get() % 3U) - 1;
 
 	dhcpv4->attempts++;
 	dhcpv4_set_timeout(dhcpv4, timeout);
+
+	return timeout;
+}
+
+static uint32_t dhcpv4_calculate_renew_rebind_timeout(uint32_t timeleft)
+{
+	uint32_t timeout;
+
+	/* RFC2131 4.4.5:
+	 * In both RENEWING and REBINDING states, if the client receives no
+	 * response to its DHCPREQUEST message, the client SHOULD wait one-half
+	 * of the remaining time until T2 (in RENEWING state) and one-half of
+	 * the remaining lease time (in REBINDING state), down to a minimum of
+	 * 60 seconds, before retransmitting the DHCPREQUEST message.
+	 */
+
+	if (timeleft < DHCPV4_RENEW_REBIND_TIMEOUT_MIN) {
+		timeout = timeleft;
+	} else if (timeleft / 2U < DHCPV4_RENEW_REBIND_TIMEOUT_MIN) {
+		timeout = DHCPV4_RENEW_REBIND_TIMEOUT_MIN;
+	} else {
+		timeout = timeleft / 2U;
+	}
+
+	return timeout;
+}
+
+static uint32_t dhcpv4_update_renew_timeout(struct net_if *iface)
+{
+	struct net_if_dhcpv4 *dhcpv4 = &iface->config.dhcpv4;
+	int64_t now = k_uptime_get();
+	uint32_t timeout;
+
+	timeout = dhcpv4_calculate_renew_rebind_timeout(
+			dhcpv4_rebinding_timeleft(iface, now));
+
+	dhcpv4->attempts++;
+	dhcpv4_set_timeout_inc(dhcpv4, now, timeout);
+
+	return timeout;
+}
+
+static uint32_t dhcpv4_update_rebind_timeout(struct net_if *iface)
+{
+	struct net_if_dhcpv4 *dhcpv4 = &iface->config.dhcpv4;
+	int64_t now = k_uptime_get();
+	uint32_t timeout;
+
+	timeout = dhcpv4_calculate_renew_rebind_timeout(
+			dhcpv4_lease_timeleft(iface, now));
+
+	dhcpv4->attempts++;
+	dhcpv4_set_timeout_inc(dhcpv4, now, timeout);
 
 	return timeout;
 }
@@ -338,6 +551,7 @@ static uint32_t dhcpv4_send_request(struct net_if *iface)
 	case NET_DHCPV4_INIT:
 	case NET_DHCPV4_SELECTING:
 	case NET_DHCPV4_BOUND:
+	case NET_DHCPV4_DECLINE:
 		/* Not possible */
 		NET_ASSERT(0, "Invalid state %s",
 			   net_dhcpv4_state_name(iface->config.dhcpv4.state));
@@ -348,6 +562,7 @@ static uint32_t dhcpv4_send_request(struct net_if *iface)
 		with_requested_ip = true;
 		memcpy(&iface->config.dhcpv4.request_server_addr, &iface->config.dhcpv4.server_id,
 		       sizeof(struct in_addr));
+		timeout = dhcpv4_update_message_timeout(&iface->config.dhcpv4);
 		break;
 	case NET_DHCPV4_RENEWING:
 		/* Since we have an address populate the ciaddr field.
@@ -357,6 +572,7 @@ static uint32_t dhcpv4_send_request(struct net_if *iface)
 		/* UNICAST the DHCPREQUEST */
 		src_addr = ciaddr;
 		server_addr = &iface->config.dhcpv4.server_id;
+		timeout = dhcpv4_update_renew_timeout(iface);
 
 		/* RFC2131 4.4.5 Client MUST NOT include server
 		 * identifier in the DHCPREQUEST.
@@ -367,11 +583,10 @@ static uint32_t dhcpv4_send_request(struct net_if *iface)
 		 */
 		ciaddr = &iface->config.dhcpv4.requested_ip;
 		src_addr = ciaddr;
+		timeout = dhcpv4_update_rebind_timeout(iface);
 
 		break;
 	}
-
-	timeout = dhcpv4_update_message_timeout(&iface->config.dhcpv4);
 
 	pkt = dhcpv4_create_message(iface, NET_DHCPV4_MSG_TYPE_REQUEST,
 				    ciaddr, src_addr, server_addr,
@@ -444,6 +659,33 @@ fail:
 			DHCPV4_INITIAL_DELAY_MIN;
 }
 
+static void dhcpv4_send_decline(struct net_if *iface)
+{
+	struct net_pkt *pkt;
+
+	iface->config.dhcpv4.xid++;
+
+	pkt = dhcpv4_create_message(iface, NET_DHCPV4_MSG_TYPE_DECLINE,
+				    NULL, NULL, net_ipv4_broadcast_address(),
+				    false, true);
+	if (!pkt) {
+		goto fail;
+	}
+
+	if (net_send_data(pkt) < 0) {
+		goto fail;
+	}
+
+	net_stats_update_udp_sent(iface);
+
+	return;
+
+fail:
+	if (pkt) {
+		net_pkt_unref(pkt);
+	}
+}
+
 static void dhcpv4_enter_selecting(struct net_if *iface)
 {
 	iface->config.dhcpv4.attempts = 0U;
@@ -458,60 +700,6 @@ static void dhcpv4_enter_selecting(struct net_if *iface)
 	iface->config.dhcpv4.state = NET_DHCPV4_SELECTING;
 	NET_DBG("enter state=%s",
 		net_dhcpv4_state_name(iface->config.dhcpv4.state));
-}
-
-static uint32_t dhcpv4_get_timeleft(int64_t start, uint32_t time, int64_t now)
-{
-	int64_t deadline = start + MSEC_PER_SEC * time;
-	uint32_t ret = 0U;
-
-	/* If we haven't reached the deadline, calculate the
-	 * rounded-up whole seconds until the deadline.
-	 */
-	if (deadline > now) {
-		ret = (uint32_t)DIV_ROUND_UP(deadline - now, MSEC_PER_SEC);
-	}
-
-	return ret;
-}
-
-static uint32_t dhcpv4_request_timeleft(struct net_if *iface, int64_t now)
-{
-	uint32_t request_time = iface->config.dhcpv4.request_time;
-
-	return dhcpv4_get_timeleft(iface->config.dhcpv4.timer_start,
-				   request_time, now);
-}
-
-static uint32_t dhcpv4_renewal_timeleft(struct net_if *iface, int64_t now)
-{
-	uint32_t rem = dhcpv4_get_timeleft(iface->config.dhcpv4.timer_start,
-					   iface->config.dhcpv4.renewal_time,
-					   now);
-
-	if (rem == 0U) {
-		iface->config.dhcpv4.state = NET_DHCPV4_RENEWING;
-		NET_DBG("enter state=%s",
-			net_dhcpv4_state_name(iface->config.dhcpv4.state));
-		iface->config.dhcpv4.attempts = 0U;
-	}
-
-	return rem;
-}
-
-static uint32_t dhcpv4_rebinding_timeleft(struct net_if *iface, int64_t now)
-{
-	uint32_t rem = dhcpv4_get_timeleft(iface->config.dhcpv4.timer_start,
-					   iface->config.dhcpv4.rebinding_time,
-					   now);
-	if (rem == 0U) {
-		iface->config.dhcpv4.state = NET_DHCPV4_REBINDING;
-		NET_DBG("enter state=%s",
-			net_dhcpv4_state_name(iface->config.dhcpv4.state));
-		iface->config.dhcpv4.attempts = 0U;
-	}
-
-	return rem;
 }
 
 static void dhcpv4_enter_requesting(struct net_if *iface, struct dhcp_msg *msg)
@@ -530,34 +718,58 @@ static void dhcpv4_enter_requesting(struct net_if *iface, struct dhcp_msg *msg)
 /* Must be invoked with lock held */
 static void dhcpv4_enter_bound(struct net_if *iface)
 {
-	uint32_t renewal_time;
-	uint32_t rebinding_time;
+	struct net_if_dhcpv4 *dhcpv4 = &iface->config.dhcpv4;
 
-	renewal_time = iface->config.dhcpv4.renewal_time;
-	if (!renewal_time) {
+	/* Load defaults in case server did not provide T1/T2 values. */
+	if (dhcpv4->renewal_time == 0U) {
 		/* The default renewal time rfc2131 4.4.5 */
-		renewal_time = iface->config.dhcpv4.lease_time / 2U;
-		iface->config.dhcpv4.renewal_time = renewal_time;
+		dhcpv4->renewal_time = dhcpv4->lease_time / 2U;
 	}
 
-	rebinding_time = iface->config.dhcpv4.rebinding_time;
-	if (!rebinding_time) {
+	if (dhcpv4->rebinding_time == 0U) {
 		/* The default rebinding time rfc2131 4.4.5 */
-		rebinding_time = iface->config.dhcpv4.lease_time * 875U / 1000;
-		iface->config.dhcpv4.rebinding_time = rebinding_time;
+		dhcpv4->rebinding_time = dhcpv4->lease_time * 875U / 1000U;
 	}
 
-	iface->config.dhcpv4.state = NET_DHCPV4_BOUND;
-	NET_DBG("enter state=%s renewal=%us rebinding=%us",
-		net_dhcpv4_state_name(iface->config.dhcpv4.state),
-		renewal_time, rebinding_time);
+	/* RFC2131 4.4.5:
+	 * T1 MUST be earlier than T2, which, in turn, MUST be earlier than the
+	 * time at which the client's lease will expire.
+	 */
+	if ((dhcpv4->renewal_time >= dhcpv4->rebinding_time) ||
+	    (dhcpv4->rebinding_time >= dhcpv4->lease_time)) {
+		/* In case server did not provide valid values, fall back to
+		 * defaults.
+		 */
+		dhcpv4->renewal_time = dhcpv4->lease_time / 2U;
+		dhcpv4->rebinding_time = dhcpv4->lease_time * 875U / 1000U;
+	}
 
-	dhcpv4_set_timeout(&iface->config.dhcpv4,
-			   MIN(renewal_time, rebinding_time));
+	dhcpv4->state = NET_DHCPV4_BOUND;
+	NET_DBG("enter state=%s renewal=%us rebinding=%us",
+		net_dhcpv4_state_name(dhcpv4->state),
+		dhcpv4->renewal_time, dhcpv4->rebinding_time);
+
+	dhcpv4_set_timeout(dhcpv4, dhcpv4->renewal_time);
 
 	net_mgmt_event_notify_with_info(NET_EVENT_IPV4_DHCP_BOUND, iface,
 					&iface->config.dhcpv4,
 					sizeof(iface->config.dhcpv4));
+}
+
+static void dhcpv4_enter_renewing(struct net_if *iface)
+{
+	iface->config.dhcpv4.state = NET_DHCPV4_RENEWING;
+	iface->config.dhcpv4.attempts = 0U;
+	NET_DBG("enter state=%s",
+		net_dhcpv4_state_name(iface->config.dhcpv4.state));
+}
+
+static void dhcpv4_enter_rebinding(struct net_if *iface)
+{
+	iface->config.dhcpv4.state = NET_DHCPV4_REBINDING;
+	iface->config.dhcpv4.attempts = 0U;
+	NET_DBG("enter state=%s",
+		net_dhcpv4_state_name(iface->config.dhcpv4.state));
 }
 
 static uint32_t dhcpv4_manage_timers(struct net_if *iface, int64_t now)
@@ -582,6 +794,9 @@ static uint32_t dhcpv4_manage_timers(struct net_if *iface, int64_t now)
 	switch (iface->config.dhcpv4.state) {
 	case NET_DHCPV4_DISABLED:
 		break;
+	case NET_DHCPV4_DECLINE:
+		dhcpv4_send_decline(iface);
+		__fallthrough;
 	case NET_DHCPV4_INIT:
 		dhcpv4_enter_selecting(iface);
 		__fallthrough;
@@ -602,34 +817,34 @@ static uint32_t dhcpv4_manage_timers(struct net_if *iface, int64_t now)
 		return dhcpv4_send_request(iface);
 	case NET_DHCPV4_BOUND:
 		timeleft = dhcpv4_renewal_timeleft(iface, now);
-		if (timeleft != 0U) {
-			timeleft = MIN(timeleft,
-				       dhcpv4_rebinding_timeleft(iface, now));
-		}
 		if (timeleft == 0U) {
+			dhcpv4_enter_renewing(iface);
 			return dhcpv4_send_request(iface);
 		}
 
 		return timeleft;
 	case NET_DHCPV4_RENEWING:
-	case NET_DHCPV4_REBINDING:
-		if (iface->config.dhcpv4.attempts >=
-					DHCPV4_MAX_NUMBER_OF_ATTEMPTS) {
-			NET_DBG("too many attempts, restart");
+		timeleft = dhcpv4_rebinding_timeleft(iface, now);
+		if (timeleft == 0U) {
+			dhcpv4_enter_rebinding(iface);
+		}
 
-			if (!net_if_ipv4_addr_rm(iface,
-					 &iface->config.dhcpv4.requested_ip)) {
+		return dhcpv4_send_request(iface);
+	case NET_DHCPV4_REBINDING:
+		timeleft = dhcpv4_lease_timeleft(iface, now);
+		if (timeleft == 0U) {
+			if (!net_if_ipv4_addr_rm(
+					iface,
+					&iface->config.dhcpv4.requested_ip)) {
 				NET_DBG("Failed to remove addr from iface");
 			}
 
-			/* Maximum number of renewal attempts failed, so start
-			 * from the beginning.
-			 */
+			/* Lease time expired, so start from the beginning. */
 			dhcpv4_enter_selecting(iface);
 			return dhcpv4_send_discover(iface);
-		} else {
-			return dhcpv4_send_request(iface);
 		}
+
+		return dhcpv4_send_request(iface);
 	}
 
 	return UINT32_MAX;
@@ -667,6 +882,71 @@ static void dhcpv4_timeout(struct k_work *work)
 	}
 }
 
+#if defined(CONFIG_NET_DHCPV4_OPTION_CALLBACKS_VENDOR_SPECIFIC)
+
+static int dhcpv4_parse_option_vendor(struct net_pkt *pkt, struct net_if *iface,
+				      enum net_dhcpv4_msg_type *msg_type, int length)
+{
+	struct net_dhcpv4_option_callback *cb, *tmp;
+	struct net_pkt_cursor backup;
+	uint8_t len;
+	uint8_t type;
+
+	if (length < 3) {
+		NET_ERR("Vendor-specific option parsing, length too short");
+		net_pkt_skip(pkt, length);
+		return -EBADMSG;
+	}
+
+	while (!net_pkt_read_u8(pkt, &type)) {
+		if (type == DHCPV4_OPTIONS_END) {
+			NET_DBG("Vendor-specific options_end");
+			return 0;
+		}
+		length--;
+
+		if (length <= 0) {
+			NET_ERR("Vendor-specific option parsing, malformed option");
+			return -EBADMSG;
+		}
+
+		if (net_pkt_read_u8(pkt, &len)) {
+			NET_ERR("Vendor-specific option parsing, bad length");
+			return -ENOBUFS;
+		}
+		length--;
+		if (length < len) {
+			NET_ERR("Vendor-specific option parsing, length too long");
+			net_pkt_skip(pkt, length);
+			return -EBADMSG;
+		}
+		net_pkt_cursor_backup(pkt, &backup);
+
+		SYS_SLIST_FOR_EACH_CONTAINER_SAFE(&option_vendor_callbacks, cb, tmp, node) {
+			if (cb->option == type) {
+				NET_ASSERT(cb->handler, "No callback handler!");
+
+				if (net_pkt_read(pkt, cb->data, MIN(cb->max_length, len))) {
+					NET_DBG("option vendor callback, read err");
+					return -ENOBUFS;
+				}
+
+				cb->handler(cb, len, *msg_type, iface);
+				net_pkt_cursor_restore(pkt, &backup);
+			}
+		}
+		net_pkt_skip(pkt, len);
+		length = length - len;
+		if (length <= 0) {
+			NET_DBG("Vendor-specific options_end (no code 255)");
+			return 0;
+		}
+	}
+	return -ENOBUFS;
+}
+
+#endif /* CONFIG_NET_DHCPV4_OPTION_CALLBACKS_VENDOR_SPECIFIC */
+
 /* Parse DHCPv4 options and retrieve relevant information
  * as per RFC 2132.
  */
@@ -682,6 +962,8 @@ static bool dhcpv4_parse_options(struct net_pkt *pkt,
 	uint8_t length;
 	uint8_t type;
 	bool router_present = false;
+	bool renewal_present = false;
+	bool rebinding_present = false;
 	bool unhandled = true;
 
 	if (net_pkt_read(pkt, cookie, sizeof(cookie)) ||
@@ -738,7 +1020,8 @@ static bool dhcpv4_parse_options(struct net_pkt *pkt,
 				return false;
 			}
 
-			net_if_ipv4_set_netmask(iface, &netmask);
+			iface->config.dhcpv4.netmask = netmask;
+
 			NET_DBG("options_subnet_mask %s",
 				net_sprint_ipv4_addr(&netmask));
 			break;
@@ -810,6 +1093,83 @@ static bool dhcpv4_parse_options(struct net_pkt *pkt,
 			break;
 		}
 #endif
+#if defined(CONFIG_LOG_BACKEND_NET_USE_DHCPV4_OPTION)
+		case DHCPV4_OPTIONS_LOG_SERVER: {
+			struct sockaddr_in log_server = { 0 };
+
+			/* Log server option may present 1 or more
+			 * addresses. Each 4 bytes in length. Log
+			 * servers should be listed in order
+			 * of preference.  Hence we choose the first
+			 * and skip the rest.
+			 */
+			if (length % 4 != 0U) {
+				NET_ERR("options_log_server, bad length");
+				return false;
+			}
+
+			if (net_pkt_read(pkt, log_server.sin_addr.s4_addr, 4) < 0 ||
+			    net_pkt_skip(pkt, length - 4U) < 0) {
+				NET_ERR("options_log_server, short packet");
+				return false;
+			}
+
+			log_server.sin_family = AF_INET;
+			log_backend_net_set_ip((struct sockaddr *)&log_server);
+
+#ifdef CONFIG_LOG_BACKEND_NET_AUTOSTART
+			log_backend_net_start();
+#endif
+
+			NET_DBG("options_log_server: %s", net_sprint_ipv4_addr(&log_server));
+
+			break;
+		}
+#endif /* CONFIG_LOG_BACKEND_NET_USE_DHCPV4_OPTION */
+#if defined(CONFIG_NET_DHCPV4_OPTION_NTP_SERVER)
+		case DHCPV4_OPTIONS_NTP_SERVER: {
+
+			/* NTP server option may present 1 or more
+			 * addresses. Each 4 bytes in length. NTP
+			 * servers should be listed in order
+			 * of preference.  Hence we choose the first
+			 * and skip the rest.
+			 */
+			if (length % 4 != 0U) {
+				NET_ERR("options_log_server, bad length");
+				return false;
+			}
+
+			if (net_pkt_read(pkt, iface->config.dhcpv4.ntp_addr.s4_addr, 4) < 0 ||
+			    net_pkt_skip(pkt, length - 4U) < 0) {
+				NET_ERR("options_ntp_server, short packet");
+				return false;
+			}
+
+			NET_DBG("options_ntp_server: %s",
+				net_sprint_ipv4_addr(&iface->config.dhcpv4.ntp_addr));
+
+			break;
+		}
+#endif /* CONFIG_NET_DHCPV4_OPTION_NTP_SERVER */
+#if defined(CONFIG_NET_DHCPV4_OPTION_CALLBACKS_VENDOR_SPECIFIC)
+		case DHCPV4_OPTIONS_VENDOR_SPECIFIC: {
+			if (!sys_slist_is_empty(&option_vendor_callbacks)) {
+				NET_DBG("options_vendor_specific");
+				if (dhcpv4_parse_option_vendor(pkt, iface, msg_type, length) ==
+				    -ENOBUFS) {
+					return false;
+				}
+			} else {
+				NET_DBG("options_vendor_specific, no callbacks");
+				if (net_pkt_skip(pkt, length)) {
+					NET_DBG("options_vendor_specific, skip err");
+					return false;
+				}
+			}
+			break;
+		}
+#endif
 		case DHCPV4_OPTIONS_LEASE_TIME:
 			if (length != 4U) {
 				NET_ERR("options_lease_time, bad length");
@@ -843,6 +1203,8 @@ static bool dhcpv4_parse_options(struct net_pkt *pkt,
 			NET_DBG("options_renewal: %u",
 				iface->config.dhcpv4.renewal_time);
 
+			renewal_present = true;
+
 			break;
 		case DHCPV4_OPTIONS_REBINDING:
 			if (length != 4U) {
@@ -860,6 +1222,8 @@ static bool dhcpv4_parse_options(struct net_pkt *pkt,
 
 			NET_DBG("options_rebinding: %u",
 				iface->config.dhcpv4.rebinding_time);
+
+			rebinding_present = true;
 
 			break;
 		case DHCPV4_OPTIONS_SERVER_ID:
@@ -922,6 +1286,23 @@ end:
 		net_if_ipv4_set_gw(iface, &any);
 	}
 
+	if (*msg_type == NET_DHCPV4_MSG_TYPE_ACK) {
+		enum net_dhcpv4_state state = iface->config.dhcpv4.state;
+
+		/* Clear Renew/Rebind times if not provided. They need to be
+		 * recalculated accordingly.
+		 */
+		if (state == NET_DHCPV4_RENEWING || state == NET_DHCPV4_REBINDING) {
+			if (!renewal_present) {
+				iface->config.dhcpv4.renewal_time = 0U;
+			}
+
+			if (!rebinding_present) {
+				iface->config.dhcpv4.rebinding_time = 0U;
+			}
+		}
+	}
+
 	return true;
 }
 
@@ -935,6 +1316,7 @@ static inline void dhcpv4_handle_msg_offer(struct net_if *iface,
 	case NET_DHCPV4_RENEWING:
 	case NET_DHCPV4_REBINDING:
 	case NET_DHCPV4_BOUND:
+	case NET_DHCPV4_DECLINE:
 		break;
 	case NET_DHCPV4_SELECTING:
 		dhcpv4_enter_requesting(iface, msg);
@@ -950,6 +1332,7 @@ static void dhcpv4_handle_msg_ack(struct net_if *iface)
 	case NET_DHCPV4_INIT:
 	case NET_DHCPV4_SELECTING:
 	case NET_DHCPV4_BOUND:
+	case NET_DHCPV4_DECLINE:
 		break;
 	case NET_DHCPV4_REQUESTING:
 		NET_INFO("Received: %s",
@@ -962,6 +1345,10 @@ static void dhcpv4_handle_msg_ack(struct net_if *iface)
 			NET_DBG("Failed to add IPv4 addr to iface %p", iface);
 			return;
 		}
+
+		net_if_ipv4_set_netmask_by_addr(iface,
+						&iface->config.dhcpv4.requested_ip,
+						&iface->config.dhcpv4.netmask);
 
 		dhcpv4_enter_bound(iface);
 		break;
@@ -995,6 +1382,7 @@ static void dhcpv4_handle_msg_nak(struct net_if *iface)
 		}
 		break;
 	case NET_DHCPV4_BOUND:
+	case NET_DHCPV4_DECLINE:
 		break;
 	case NET_DHCPV4_RENEWING:
 	case NET_DHCPV4_REBINDING:
@@ -1160,7 +1548,7 @@ static void dhcpv4_iface_event_handler(struct net_mgmt_event_callback *cb,
 
 		if (iface->config.dhcpv4.state == NET_DHCPV4_BOUND) {
 			iface->config.dhcpv4.attempts = 0U;
-			iface->config.dhcpv4.state = NET_DHCPV4_RENEWING;
+			iface->config.dhcpv4.state = NET_DHCPV4_INIT;
 			NET_DBG("enter state=%s", net_dhcpv4_state_name(
 					iface->config.dhcpv4.state));
 			/* Remove any bound address as interface is gone */
@@ -1183,6 +1571,57 @@ out:
 	k_mutex_unlock(&lock);
 }
 
+#if defined(CONFIG_NET_IPV4_ACD)
+static void dhcpv4_acd_event_handler(struct net_mgmt_event_callback *cb,
+				     uint32_t mgmt_event, struct net_if *iface)
+{
+	sys_snode_t *node = NULL;
+	struct in_addr *addr;
+
+
+	k_mutex_lock(&lock, K_FOREVER);
+
+	SYS_SLIST_FOR_EACH_NODE(&dhcpv4_ifaces, node) {
+		if (node == &iface->config.dhcpv4.node) {
+			break;
+		}
+	}
+
+	if (node == NULL) {
+		goto out;
+	}
+
+	if (mgmt_event != NET_EVENT_IPV4_ACD_FAILED &&
+	    mgmt_event != NET_EVENT_IPV4_ACD_CONFLICT) {
+		goto out;
+	}
+
+	if (cb->info_length != sizeof(struct in_addr)) {
+		goto out;
+	}
+
+	addr = (struct in_addr *)cb->info;
+
+	if (!net_ipv4_addr_cmp(&iface->config.dhcpv4.requested_ip, addr)) {
+		goto out;
+	}
+
+	if (mgmt_event == NET_EVENT_IPV4_ACD_CONFLICT) {
+		/* Need to remove address explicitly in this case. */
+		(void)net_if_ipv4_addr_rm(iface, &iface->config.dhcpv4.requested_ip);
+	}
+
+	NET_DBG("Conflict on DHCP assigned address %s, starting over",
+		net_sprint_ipv4_addr(addr));
+
+	iface->config.dhcpv4.state = NET_DHCPV4_DECLINE;
+	dhcpv4_immediate_timeout(&iface->config.dhcpv4);
+
+out:
+	k_mutex_unlock(&lock);
+}
+#endif /* CONFIG_NET_IPV4_ACD */
+
 const char *net_dhcpv4_state_name(enum net_dhcpv4_state state)
 {
 	static const char * const name[] = {
@@ -1193,6 +1632,7 @@ const char *net_dhcpv4_state_name(enum net_dhcpv4_state state)
 		"renewing",
 		"rebinding",
 		"bound",
+		"decline,"
 	};
 
 	__ASSERT_NO_MSG(state >= 0 && state < sizeof(name));
@@ -1256,7 +1696,10 @@ static void dhcpv4_start_internal(struct net_if *iface, bool first_start)
 		NET_DBG("wait timeout=%us", timeout);
 
 		if (sys_slist_is_empty(&dhcpv4_ifaces)) {
-			net_mgmt_add_event_callback(&mgmt4_cb);
+			net_mgmt_add_event_callback(&mgmt4_if_cb);
+#if defined(CONFIG_NET_IPV4_ACD)
+			net_mgmt_add_event_callback(&mgmt4_acd_cb);
+#endif
 		}
 
 		sys_slist_append(&dhcpv4_ifaces,
@@ -1271,6 +1714,7 @@ static void dhcpv4_start_internal(struct net_if *iface, bool first_start)
 	case NET_DHCPV4_RENEWING:
 	case NET_DHCPV4_REBINDING:
 	case NET_DHCPV4_BOUND:
+	case NET_DHCPV4_DECLINE:
 		break;
 	}
 
@@ -1281,12 +1725,13 @@ static void dhcpv4_start_internal(struct net_if *iface, bool first_start)
 
 int net_dhcpv4_add_option_callback(struct net_dhcpv4_option_callback *cb)
 {
-	if (!cb || !cb->handler) {
+	if (cb == NULL || cb->handler == NULL) {
 		return -EINVAL;
 	}
 
 	k_mutex_lock(&lock, K_FOREVER);
 	sys_slist_prepend(&option_callbacks, &cb->node);
+	dhcpv4_option_callback_count();
 	k_mutex_unlock(&lock);
 	return 0;
 }
@@ -1295,7 +1740,7 @@ int net_dhcpv4_remove_option_callback(struct net_dhcpv4_option_callback *cb)
 {
 	int ret = 0;
 
-	if (!cb || !cb->handler) {
+	if (cb == NULL || cb->handler == NULL) {
 		return -EINVAL;
 	}
 
@@ -1303,11 +1748,44 @@ int net_dhcpv4_remove_option_callback(struct net_dhcpv4_option_callback *cb)
 	if (!sys_slist_find_and_remove(&option_callbacks, &cb->node)) {
 		ret = -EINVAL;
 	}
+	dhcpv4_option_callback_count();
 	k_mutex_unlock(&lock);
 	return ret;
 }
 
 #endif /* CONFIG_NET_DHCPV4_OPTION_CALLBACKS */
+
+#if defined(CONFIG_NET_DHCPV4_OPTION_CALLBACKS_VENDOR_SPECIFIC)
+
+int net_dhcpv4_add_option_vendor_callback(struct net_dhcpv4_option_callback *cb)
+{
+	if (cb == NULL || cb->handler == NULL) {
+		return -EINVAL;
+	}
+
+	k_mutex_lock(&lock, K_FOREVER);
+	sys_slist_prepend(&option_vendor_callbacks, &cb->node);
+	k_mutex_unlock(&lock);
+	return 0;
+}
+
+int net_dhcpv4_remove_option_vendor_callback(struct net_dhcpv4_option_callback *cb)
+{
+	int ret = 0;
+
+	if (cb == NULL || cb->handler == NULL) {
+		return -EINVAL;
+	}
+
+	k_mutex_lock(&lock, K_FOREVER);
+	if (!sys_slist_find_and_remove(&option_vendor_callbacks, &cb->node)) {
+		ret = -EINVAL;
+	}
+	k_mutex_unlock(&lock);
+	return ret;
+}
+
+#endif /* CONFIG_NET_DHCPV4_OPTION_CALLBACKS_VENDOR_SPECIFIC */
 
 void net_dhcpv4_start(struct net_if *iface)
 {
@@ -1334,6 +1812,7 @@ void net_dhcpv4_stop(struct net_if *iface)
 	case NET_DHCPV4_SELECTING:
 	case NET_DHCPV4_REQUESTING:
 	case NET_DHCPV4_REBINDING:
+	case NET_DHCPV4_DECLINE:
 		iface->config.dhcpv4.state = NET_DHCPV4_DISABLED;
 		NET_DBG("state=%s",
 			net_dhcpv4_state_name(iface->config.dhcpv4.state));
@@ -1346,7 +1825,10 @@ void net_dhcpv4_stop(struct net_if *iface)
 			 * cancellation is unsuccessful.
 			 */
 			(void)k_work_cancel_delayable(&timeout_work);
-			net_mgmt_del_event_callback(&mgmt4_cb);
+			net_mgmt_del_event_callback(&mgmt4_if_cb);
+#if defined(CONFIG_NET_IPV4_ACD)
+			net_mgmt_del_event_callback(&mgmt4_acd_cb);
+#endif
 		}
 
 		break;
@@ -1392,14 +1874,14 @@ int net_dhcpv4_init(void)
 	/* Catch network interface UP or DOWN events and renew the address
 	 * if interface is coming back up again.
 	 */
-	net_mgmt_init_event_callback(&mgmt4_cb, dhcpv4_iface_event_handler,
-					 NET_EVENT_IF_DOWN | NET_EVENT_IF_UP);
-
-#if defined(CONFIG_NET_DHCPV4_OPTION_CALLBACKS)
-	k_mutex_lock(&lock, K_FOREVER);
-	sys_slist_init(&option_callbacks);
-	k_mutex_unlock(&lock);
+	net_mgmt_init_event_callback(&mgmt4_if_cb, dhcpv4_iface_event_handler,
+				     NET_EVENT_IF_DOWN | NET_EVENT_IF_UP);
+#if defined(CONFIG_NET_IPV4_ACD)
+	net_mgmt_init_event_callback(&mgmt4_acd_cb, dhcpv4_acd_event_handler,
+				     NET_EVENT_IPV4_ACD_FAILED |
+				     NET_EVENT_IPV4_ACD_CONFLICT);
 #endif
+
 	return 0;
 }
 

@@ -1,13 +1,30 @@
 /*
  * Copyright (c) 2019 Bose Corporation
- * Copyright (c) 2020-2022 Nordic Semiconductor ASA
+ * Copyright (c) 2020-2024 Nordic Semiconductor ASA
  *
  * SPDX-License-Identifier: Apache-2.0
  */
-#ifdef CONFIG_BT_CSIP_SET_COORDINATOR
-#include <zephyr/bluetooth/addr.h>
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+#include <string.h>
+
+#include <zephyr/autoconf.h>
 #include <zephyr/bluetooth/audio/csip.h>
+#include <zephyr/bluetooth/addr.h>
+#include <zephyr/bluetooth/bluetooth.h>
+#include <zephyr/bluetooth/conn.h>
+#include <zephyr/bluetooth/gap.h>
+#include <zephyr/bluetooth/hci_types.h>
+#include <zephyr/kernel.h>
+#include <zephyr/net/buf.h>
+#include <zephyr/sys/printk.h>
+#include <zephyr/sys/util.h>
+
+#include "bstests.h"
 #include "common.h"
+
+#ifdef CONFIG_BT_CSIP_SET_COORDINATOR
 
 static bool expect_rank = true;
 static bool expect_set_size = true;
@@ -22,7 +39,9 @@ static volatile bool set_unlocked;
 static volatile bool ordered_access_locked;
 static volatile bool ordered_access_unlocked;
 static const struct bt_csip_set_coordinator_csis_inst *primary_inst;
+CREATE_FLAG(flag_sirk_changed);
 
+static uint8_t connected_member_count;
 static uint8_t members_found;
 static struct k_work_delayable discover_members_timer;
 static bt_addr_le_t addr_found[CONFIG_BT_MAX_CONN];
@@ -113,6 +132,13 @@ static void csip_lock_changed_cb(struct bt_csip_set_coordinator_csis_inst *inst,
 	printk("inst %p %s\n", inst, locked ? "locked" : "released");
 }
 
+static void csip_sirk_changed_cb(struct bt_csip_set_coordinator_csis_inst *inst)
+{
+	printk("Inst %p SIRK changed\n", inst);
+
+	SET_FLAG(flag_sirk_changed);
+}
+
 static void csip_set_coordinator_ordered_access_cb(
 	const struct bt_csip_set_coordinator_set_info *set_info, int err,
 	bool locked,  struct bt_csip_set_coordinator_set_member *member)
@@ -133,7 +159,8 @@ static struct bt_csip_set_coordinator_cb cbs = {
 	.release_set = csip_set_coordinator_lock_release_cb,
 	.discover = csip_discover_cb,
 	.lock_changed = csip_lock_changed_cb,
-	.ordered_access = csip_set_coordinator_ordered_access_cb
+	.sirk_changed = csip_sirk_changed_cb,
+	.ordered_access = csip_set_coordinator_ordered_access_cb,
 };
 
 static bool csip_set_coordinator_oap_cb(const struct bt_csip_set_coordinator_set_info *set_info,
@@ -159,7 +186,7 @@ static bool is_discovered(const bt_addr_le_t *addr)
 
 static bool csip_found(struct bt_data *data, void *user_data)
 {
-	if (bt_csip_set_coordinator_is_set_member(primary_inst->info.set_sirk, data)) {
+	if (bt_csip_set_coordinator_is_set_member(primary_inst->info.sirk, data)) {
 		const bt_addr_le_t *addr = user_data;
 		char addr_str[BT_ADDR_LE_STR_LEN];
 
@@ -263,12 +290,9 @@ static void discover_csis(struct bt_conn *conn)
 	WAIT_FOR_COND(discovered);
 }
 
-static void test_main(void)
+static void init(void)
 {
 	int err;
-	char addr[BT_ADDR_LE_STR_LEN];
-	const struct bt_csip_set_coordinator_set_member *locked_members[CONFIG_BT_MAX_CONN];
-	uint8_t connected_member_count = 0;
 
 	err = bt_enable(NULL);
 	if (err != 0) {
@@ -282,21 +306,31 @@ static void test_main(void)
 	k_work_init_delayable(&discover_members_timer,
 			      discover_members_timer_handler);
 	bt_le_scan_cb_register(&csip_set_coordinator_scan_callbacks);
+}
+
+static void connect_set(void)
+{
+	char addr[BT_ADDR_LE_STR_LEN];
+	int err;
+
+	connected_member_count = 0U;
 
 	err = bt_le_scan_start(BT_LE_SCAN_PASSIVE, NULL);
 	if (err != 0) {
 		FAIL("Scanning failed to start (err %d)\n", err);
+
 		return;
 	}
 
 	printk("Scanning successfully started\n");
 
-	WAIT_FOR_COND(members_found == 1);
+	WAIT_FOR_COND(members_found == 1U);
 
 	printk("Stopping scan\n");
 	err = bt_le_scan_stop();
 	if (err != 0) {
 		FAIL("Could not stop scan");
+
 		return;
 	}
 
@@ -305,6 +339,7 @@ static void test_main(void)
 				BT_LE_CONN_PARAM_DEFAULT, &conns[0]);
 	if (err != 0) {
 		FAIL("Failed to connect to %s: %d\n", err);
+
 		return;
 	}
 	printk("Connecting to %s\n", addr);
@@ -318,6 +353,7 @@ static void test_main(void)
 	err = bt_le_scan_start(BT_LE_SCAN_ACTIVE, NULL);
 	if (err != 0) {
 		FAIL("Could not start scan: %d", err);
+
 		return;
 	}
 
@@ -325,10 +361,11 @@ static void test_main(void)
 				BT_CSIP_SET_COORDINATOR_DISCOVER_TIMER_VALUE);
 	if (err < 0) { /* Can return 0, 1 and 2 for success */
 		FAIL("Could not schedule discover_members_timer %d", err);
+
 		return;
 	}
 
-	if (primary_inst->info.set_size > 0) {
+	if (primary_inst->info.set_size > 0U) {
 		WAIT_FOR_COND(members_found == primary_inst->info.set_size);
 
 		(void)k_work_cancel_delayable(&discover_members_timer);
@@ -339,6 +376,7 @@ static void test_main(void)
 	err = bt_le_scan_stop();
 	if (err != 0) {
 		FAIL("Scanning failed to stop (err %d)\n", err);
+
 		return;
 	}
 
@@ -347,12 +385,11 @@ static void test_main(void)
 
 		UNSET_FLAG(flag_connected);
 		printk("Connecting to member[%d] (%s)", i, addr);
-		err = bt_conn_le_create(&addr_found[i],
-					BT_CONN_LE_CREATE_CONN,
-					BT_LE_CONN_PARAM_DEFAULT,
-					&conns[i]);
+		err = bt_conn_le_create(&addr_found[i], BT_CONN_LE_CREATE_CONN,
+					BT_LE_CONN_PARAM_DEFAULT, &conns[i]);
 		if (err != 0) {
 			FAIL("Failed to connect to %s: %d\n", addr, err);
+
 			return;
 		}
 
@@ -363,6 +400,33 @@ static void test_main(void)
 		printk("Doing discovery on member[%u]", i);
 		discover_csis(conns[i]);
 	}
+}
+
+static void disconnect_set(void)
+{
+	for (uint8_t i = 0; i < connected_member_count; i++) {
+		char addr[BT_ADDR_LE_STR_LEN];
+		int err;
+
+		bt_addr_le_to_str(&addr_found[i], addr, sizeof(addr));
+
+		printk("Disconnecting member[%u] (%s)", i, addr);
+		err = bt_conn_disconnect(conns[i], BT_HCI_ERR_REMOTE_USER_TERM_CONN);
+		(void)memset(&set_members[i], 0, sizeof(set_members[i]));
+		if (err != 0) {
+			FAIL("Failed to do disconnect\n", err);
+			return;
+		}
+	}
+}
+
+static void test_main(void)
+{
+	const struct bt_csip_set_coordinator_set_member *locked_members[CONFIG_BT_MAX_CONN];
+	int err;
+
+	init();
+	connect_set();
 
 	for (size_t i = 0; i < ARRAY_SIZE(locked_members); i++) {
 		locked_members[i] = set_members[i];
@@ -436,16 +500,22 @@ static void test_main(void)
 		WAIT_FOR_COND(set_unlocked);
 	}
 
-	for (uint8_t i = 0; i < members_found; i++) {
-		printk("Disconnecting member[%u] (%s)", i, addr);
-		err = bt_conn_disconnect(conns[i],
-					 BT_HCI_ERR_REMOTE_USER_TERM_CONN);
-		(void)memset(&set_members[i], 0, sizeof(set_members[i]));
-		if (err != 0) {
-			FAIL("Failed to do disconnect\n", err);
-			return;
-		}
-	}
+	disconnect_set();
+
+	PASS("All members disconnected\n");
+}
+
+static void test_new_sirk(void)
+{
+	init();
+	connect_set();
+
+	backchannel_sync_send_all();
+	backchannel_sync_wait_all();
+
+	WAIT_FOR_FLAG(flag_sirk_changed);
+
+	disconnect_set();
 
 	PASS("All members disconnected\n");
 }
@@ -468,16 +538,22 @@ static void test_args(int argc, char *argv[])
 }
 
 static const struct bst_test_instance test_connect[] = {
-
 	{
 		.test_id = "csip_set_coordinator",
-		.test_post_init_f = test_init,
+		.test_pre_init_f = test_init,
 		.test_tick_f = test_tick,
 		.test_main_f = test_main,
 		.test_args_f = test_args,
 	},
-
-	BSTEST_END_MARKER};
+	{
+		.test_id = "csip_set_coordinator_new_sirk",
+		.test_pre_init_f = test_init,
+		.test_tick_f = test_tick,
+		.test_main_f = test_new_sirk,
+		.test_args_f = test_args,
+	},
+	BSTEST_END_MARKER,
+};
 
 struct bst_test_list *test_csip_set_coordinator_install(struct bst_test_list *tests)
 {
