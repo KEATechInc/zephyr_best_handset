@@ -21,6 +21,12 @@
 
 #include "bme680.h"
 
+/* KEA overrides */
+#undef  BME680_HEATR_TEMP
+#define BME680_HEATR_TEMP 360
+#undef  BME680_HEATR_DUR_MS
+#define BME680_HEATR_DUR_MS 50
+
 LOG_MODULE_REGISTER(bme680, CONFIG_SENSOR_LOG_LEVEL);
 
 struct bme_data_regs {
@@ -432,21 +438,17 @@ static int bme680_init(const struct device *dev)
 		return err;
 	}
 
-	// Configure  the VOC heater with our custom settings
-	uint16_t CUSTOM_HEATR_TEMP = 320;
-	uint16_t CUSTOM_HEATR_DUR_MS = 197;
-	
-	err = bme680_reg_write(dev, BME680_REG_RES_HEAT0, bme680_calc_res_heat(data, CUSTOM_HEATR_TEMP));
+	err = bme680_reg_write(dev, BME680_REG_RES_HEAT0,
+			       bme680_calc_res_heat(data, BME680_HEATR_TEMP));
 	if (err < 0) {
 		return err;
 	}
-	LOG_INF("Gas Heater Temp Setting: %d C", BME680_HEATR_TEMP);
 
-	err = bme680_reg_write(dev, BME680_REG_GAS_WAIT0, bme680_calc_gas_wait(CUSTOM_HEATR_DUR_MS));
+	err = bme680_reg_write(dev, BME680_REG_GAS_WAIT0,
+			       bme680_calc_gas_wait(BME680_HEATR_DUR_MS));
 	if (err < 0) {
 		return err;
 	}
-	LOG_INF("Gas Heater Duration: %d ms", CUSTOM_HEATR_DUR_MS);
 
 	err = bme680_reg_write(dev, BME680_REG_CTRL_MEAS,
 			       BME680_CTRL_MEAS_VAL);
